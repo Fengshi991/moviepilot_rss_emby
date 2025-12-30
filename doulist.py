@@ -2,6 +2,9 @@ import os
 import time
 import json
 import random
+import uuid
+import tempfile
+import shutil
 from typing import List, Dict, Tuple, Optional
 
 import requests
@@ -61,6 +64,72 @@ FILTERED_ROOT_DIR = "rss_filtered"
 def safe_mkdir(path: str):
     if path and not os.path.exists(path):
         os.makedirs(path)
+
+
+def _acquire_lock(lock_path: str, timeout: int = 10) -> bool:
+    """尝试创建一个原子锁文件（通过 O_EXCL），成功返回 True，超时返回 False。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            time.sleep(0.1)
+    return False
+
+
+def _release_lock(lock_path: str):
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+
+
+def _atomic_write(path: str, writer_callable, enable_backup: bool = True, enable_lock: bool = False, lock_timeout: int = 10):
+    """
+    原子写入：先写入临时文件，然后可选备份旧文件，最后用 `os.replace` 原子替换目标文件。
+    `writer_callable(tmp_path)` 负责把数据写到 tmp_path。
+    如果 enable_lock=True，会在目标路径旁创建 `.lock` 文件做简易锁。
+    """
+    tmp_path = f"{path}.tmp.{uuid.uuid4().hex}"
+    lock_path = f"{path}.lock"
+    lock_acquired = False
+    try:
+        if enable_lock:
+            lock_acquired = _acquire_lock(lock_path, timeout=lock_timeout)
+            if not lock_acquired:
+                raise RuntimeError(f"无法获取写锁：{lock_path}")
+
+        # 确保目录存在
+        safe_mkdir(os.path.dirname(path) or '.')
+
+        # 写入临时文件
+        writer_callable(tmp_path)
+
+        # 备份旧文件（可选）
+        if enable_backup and os.path.exists(path):
+            try:
+                bak_name = f"{path}.bak.{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+                os.replace(path, bak_name)
+            except Exception:
+                # 备份失败不阻止替换
+                pass
+
+        # 原子替换
+        os.replace(tmp_path, path)
+    finally:
+        if lock_acquired:
+            _release_lock(lock_path)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 def fetch_page(url: str, retries: int = 10, delay: int = 10) -> str:
@@ -265,7 +334,11 @@ def build_rss(
 
         SubElement(item_el, "description").text = " | ".join(desc_parts)
 
-    ElementTree(rss).write(output_file, encoding="utf-8", xml_declaration=True)
+    def _write_xml(tmp_path: str):
+        ElementTree(rss).write(tmp_path, encoding="utf-8", xml_declaration=True)
+
+    # 使用原子写入，默认开启备份，不开启锁（可按需改为 True）
+    _atomic_write(output_file, _write_xml, enable_backup=True, enable_lock=False)
     print(f"RSS 已写入 {output_file}")
 
 
@@ -294,8 +367,13 @@ def load_cache(cache_dir: str, doulist_id: str) -> List[Dict]:
 
 def save_cache(cache_dir: str, doulist_id: str, items: List[Dict]):
     path = cache_file_path(cache_dir, doulist_id)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+
+    def _write_json(tmp_path: str):
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+    # 原子写入 + 备份（默认开启），锁为可选（默认关闭）
+        _atomic_write(path, _write_json, enable_backup=True, enable_lock=True)
 
 
 # ========================= 抓取单豆列 =========================
@@ -324,6 +402,13 @@ def crawl_single_doulist(
 
         if not page_items:
             break
+
+        # 标记每条记录的来源（豆列 id），便于后续合并时可以按豆列过滤/排除
+        for it in page_items:
+            try:
+                it["source"] = doulist_id
+            except Exception:
+                pass
 
         all_items.extend(page_items)
 
@@ -355,7 +440,7 @@ def crawl_single_doulist(
         url = next_url
         page += 1
 
-    print(f"豆列 {doulist_id} 共抓到 {len(all_items)} 条（未去重、未过滤）。")
+        _atomic_write(output_file, _write_xml, enable_backup=True, enable_lock=True)
     return all_items
 
 
@@ -363,6 +448,7 @@ def crawl_single_doulist(
 
 def crawl_multiple_doulists(
     urls: List[str],
+    exclude_urls: Optional[List[str]] = None,
     start_page: int = 1,
     dedup_mode: str = "title_year",
     min_year: Optional[int] = None,
@@ -389,6 +475,20 @@ def crawl_multiple_doulists(
         all_items_raw.extend(items)
 
     print(f"所有豆列合并后，共有 {len(all_items_raw)} 条（未去重）。")
+
+    # 处理排除的豆列：如果用户提供了要排除的豆列 URL/ID，则从合并结果中移除这些来源的条目
+    excluded_ids = set()
+    if exclude_urls:
+        for eu in exclude_urls:
+            if not eu:
+                continue
+            excluded_ids.add(extract_doulist_id(eu))
+
+    if excluded_ids:
+        before_count = len(all_items_raw)
+        all_items_raw = [it for it in all_items_raw if (it.get("source") not in excluded_ids)]
+        removed = before_count - len(all_items_raw)
+        print(f"已排除来自豆列 {sorted(list(excluded_ids))} 的内容，共移除 {removed} 条记录。")
 
     all_items_dedup = deduplicate_items(all_items_raw, mode=dedup_mode)
     print(f"去重后剩余 {len(all_items_dedup)} 条。")
@@ -467,8 +567,12 @@ def main():
         if y_str.isdigit():
             max_year = int(y_str)
 
+    exclude_str = smart_input("请输入要排除的豆列 URL（可多个，用英文逗号 , 分隔，留空不排除）：\n> ", default="")
+    exclude_list = [u.strip() for u in exclude_str.split(",") if u.strip()] if exclude_str else []
+
     crawl_multiple_doulists(
         urls=url_list,
+        exclude_urls=exclude_list,
         start_page=start_page,
         dedup_mode=dedup_mode,
         min_year=min_year,
