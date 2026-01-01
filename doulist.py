@@ -6,6 +6,8 @@ import uuid
 import tempfile
 import shutil
 from typing import List, Dict, Tuple, Optional
+import unicodedata
+import re
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,6 +16,20 @@ from email.utils import format_datetime
 from datetime import datetime, timezone
 
 _SESSION = None
+
+# 尝试初始化繁体->简体转换器（优先 OpenCC，回退到 zhconv），否则设置为 None
+_T2S_CONVERTER = None
+try:
+    from opencc import OpenCC  # type: ignore
+    _OPENCC_T2S = OpenCC('t2s')
+    _T2S_CONVERTER = _OPENCC_T2S.convert
+except Exception:
+    try:
+        from zhconv import convert as _zhconv_convert  # type: ignore
+        _T2S_CONVERTER = lambda s: _zhconv_convert(s, 'zh-cn')
+    except Exception:
+        _T2S_CONVERTER = None
+        _OPENCC_WARNED = False
 
 def smart_input(prompt_text: str, default: str = "") -> str:
     """
@@ -177,6 +193,24 @@ def parse_page(html: str) -> Tuple[List[Dict], BeautifulSoup]:
             continue
 
         full_title = title_a.get_text(strip=True)
+        # 优先把原始标题转换为简体（如果 opencc 可用），再取用于展示的更简洁分段
+        try:
+            if _OPENCC_T2S:
+                simplified = _OPENCC_T2S.convert(full_title)
+            else:
+                simplified = full_title
+                # 一次性警告用户安装 opencc 以获得更好繁简转换
+                if not globals().get("_OPENCC_WARNED", False):
+                    print("警告：未检测到 opencc，无法自动将繁体转换为简体。可通过 'pip install opencc-python-reimplemented' 安装。")
+                    globals()["_OPENCC_WARNED"] = True
+        except Exception:
+            simplified = full_title
+
+        try:
+            display_title = choose_display_title(simplified)
+        except Exception:
+            display_title = simplified
+
         link = (title_a.get("href") or "").strip()
 
         info = {"director": "", "cast": "", "genre": "", "country": "", "year": ""}
@@ -195,7 +229,7 @@ def parse_page(html: str) -> Tuple[List[Dict], BeautifulSoup]:
             elif line.startswith("年份:"):
                 info["year"] = line.replace("年份:", "", 1).strip()
 
-        items.append({"title": full_title, "link": link, **info})
+        items.append({"title": display_title, "title_raw": full_title, "link": link, **info})
 
     return items, soup
 
@@ -233,6 +267,60 @@ def normalize_year(year_str: str) -> Optional[int]:
     return int(year_str)
 
 
+def normalize_title_str(title: str) -> str:
+    """模块级标题规范化：NFKC、可选繁体->简体、去标点、去重复串联，返回紧凑的比较键。"""
+    if not title:
+        return ""
+    s = unicodedata.normalize("NFKC", title)
+    s = s.strip().lower()
+
+    # 使用模块级已初始化的 OpenCC 转换器（如果存在）以保证一致性
+    try:
+        if _T2S_CONVERTER:
+            s = _T2S_CONVERTER(s)
+    except Exception:
+        pass
+
+    s = re.sub(r"[^\w\u4e00-\u9fff]+", "", s)
+
+    if s:
+        L = len(s)
+        for n in range(1, L // 2 + 1):
+            if L % n != 0:
+                continue
+            part = s[:n]
+            if part * (L // n) == s:
+                s = part
+                break
+
+    return s
+
+
+def choose_display_title(title: str) -> str:
+    """从可能包含繁简并列的原始标题中选出更简洁的展示标题。
+    规则：如果把所有空白去掉后与第一个空白分段规范化后相同，则返回第一个分段；否则返回原始标题。
+    """
+    if not title or " " not in title:
+        return title
+    parts = title.split()
+    if len(parts) < 2:
+        return title
+    first = parts[0]
+    joined = "".join(parts)
+    try:
+        if normalize_title_str(joined) and normalize_title_str(joined) == normalize_title_str(first):
+            return first
+    except Exception:
+        pass
+    # 备用：如果前两段规范化相同，返回第一段
+    try:
+        if normalize_title_str(parts[0]) == normalize_title_str(parts[1]):
+            return parts[0]
+    except Exception:
+        pass
+    return title
+
+
 def deduplicate_items(items: List[Dict], mode: str = "title_year") -> List[Dict]:
     """
     mode:
@@ -241,6 +329,8 @@ def deduplicate_items(items: List[Dict], mode: str = "title_year") -> List[Dict]
       - link: link
     保留第一条出现的记录。
     """
+    # 使用模块级 normalize_title_str
+
     seen = set()
     result = []
 
@@ -249,12 +339,14 @@ def deduplicate_items(items: List[Dict], mode: str = "title_year") -> List[Dict]
         year = (m.get("year") or "").strip()
         link = (m.get("link") or "").strip()
 
+        norm_title = normalize_title_str(title) or title
+
         if mode == "title_link":
-            key = (title, link)
+            key = (norm_title, link)
         elif mode == "link":
             key = link
         else:
-            key = (title, year)
+            key = (norm_title, year)
 
         if key in seen:
             continue
@@ -310,8 +402,12 @@ def build_rss(
 
         year = (m.get("year") or "").strip()
         title_text = (m.get("title") or "").strip()
+        # 选择更干净的展示标题（处理繁简并列）
+        display_title = choose_display_title(title_text)
         if year:
-            title_text = f"{title_text} ({year})"
+            title_text = f"{display_title} ({year})"
+        else:
+            title_text = display_title
 
         SubElement(item_el, "title").text = title_text
         SubElement(item_el, "link").text = (m.get("link") or "").strip()
@@ -373,8 +469,11 @@ def build_rss_segmented(
 
             year = (m.get("year") or "").strip()
             title_text = (m.get("title") or "").strip()
+            display_title = choose_display_title(title_text)
             if year:
-                title_text = f"{title_text} ({year})"
+                title_text = f"{display_title} ({year})"
+            else:
+                title_text = display_title
 
             SubElement(item_el, "title").text = title_text
             SubElement(item_el, "link").text = (m.get("link") or "").strip()
