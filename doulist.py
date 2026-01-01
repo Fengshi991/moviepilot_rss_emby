@@ -407,20 +407,38 @@ def build_rss_segmented(
         print(f"RSS 已写入 {path}")
 
     total = len(items)
-    if total <= chunk_size:
-        tree = _make_rss_for_items(items)
-        _write_rss_tree(tree, output_file)
-        return
-
     base, ext = os.path.splitext(output_file)
-    num = (total + chunk_size - 1) // chunk_size
+    num = (total + chunk_size - 1) // chunk_size if total > 0 else 1
+    parts_info = []
+
     for i in range(num):
         start = i * chunk_size
-        end = start + chunk_size
+        end = min(start + chunk_size, total)
         chunk = items[start:end]
-        part_path = f"{base}_{i+1}{ext}"
+        part_path = f"{base}_part_{i+1}_of_{num}{ext}"
         tree = _make_rss_for_items(chunk)
         _write_rss_tree(tree, part_path)
+        parts_info.append({
+            "file": os.path.basename(part_path),
+            "index": i + 1,
+            "of": num,
+            "start_item": start + 1 if total>0 else 0,
+            "end_item": end,
+            "count": len(chunk),
+        })
+
+    # 写入一个清单文件，方便查阅哪个文件包含哪些条目
+    manifest_path = f"{base}_parts.json"
+    def _write_manifest(tmp_path: str):
+        with open(tmp_path, "w", encoding="utf-8") as mf:
+            json.dump({
+                "total_items": total,
+                "chunk_size": chunk_size,
+                "parts": parts_info,
+            }, mf, ensure_ascii=False, indent=2)
+
+    _atomic_write(manifest_path, _write_manifest, enable_backup=True, enable_lock=False)
+    print(f"Parts 清单已写入 {manifest_path}")
 
 
 # ========================= 缓存 =========================
