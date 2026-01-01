@@ -342,6 +342,87 @@ def build_rss(
     print(f"RSS 已写入 {output_file}")
 
 
+def build_rss_segmented(
+    items: List[Dict],
+    start_url: str,
+    output_file: str,
+    title: str = "",
+    description: str = "",
+    chunk_size: int = 500,
+):
+    """
+    将 items 按照 chunk_size 分段写入多个 RSS 文件。
+    当总量 <= chunk_size 时，写入原始 output_file；否则生成带序号的文件名，格式为 base_1.ext, base_2.ext ...
+    """
+    safe_mkdir(os.path.dirname(output_file))
+
+    if not items:
+        print(f"没有内容，跳过写入 {output_file}")
+        return
+
+    def _make_rss_for_items(chunk_items: List[Dict]) -> Element:
+        rss = Element("rss", version="2.0")
+        channel = SubElement(rss, "channel")
+
+        SubElement(channel, "title").text = title or "豆瓣豆列 - RSS 抓取"
+        SubElement(channel, "link").text = start_url
+        SubElement(channel, "description").text = description or "从多个豆列抓取的电影列表"
+
+        for m in chunk_items:
+            item_el = SubElement(channel, "item")
+
+            year = (m.get("year") or "").strip()
+            title_text = (m.get("title") or "").strip()
+            if year:
+                title_text = f"{title_text} ({year})"
+
+            SubElement(item_el, "title").text = title_text
+            SubElement(item_el, "link").text = (m.get("link") or "").strip()
+
+            pubdate = year_to_pubdate(year)
+            if pubdate:
+                SubElement(item_el, "pubDate").text = pubdate
+
+            desc_parts = []
+            if m.get("director"):
+                desc_parts.append(f"导演: {m['director']}")
+            if m.get("cast"):
+                desc_parts.append(f"主演: {m['cast']}")
+            if m.get("genre"):
+                desc_parts.append(f"类型: {m['genre']}")
+            if m.get("country"):
+                desc_parts.append(f"制片国家/地区: {m['country']}")
+            if year:
+                desc_parts.append(f"年份: {year}")
+
+            SubElement(item_el, "description").text = " | ".join(desc_parts)
+
+        return rss
+
+    def _write_rss_tree(tree: Element, path: str):
+        def _write_xml(tmp_path: str):
+            ElementTree(tree).write(tmp_path, encoding="utf-8", xml_declaration=True)
+
+        _atomic_write(path, _write_xml, enable_backup=True, enable_lock=False)
+        print(f"RSS 已写入 {path}")
+
+    total = len(items)
+    if total <= chunk_size:
+        tree = _make_rss_for_items(items)
+        _write_rss_tree(tree, output_file)
+        return
+
+    base, ext = os.path.splitext(output_file)
+    num = (total + chunk_size - 1) // chunk_size
+    for i in range(num):
+        start = i * chunk_size
+        end = start + chunk_size
+        chunk = items[start:end]
+        part_path = f"{base}_{i+1}{ext}"
+        tree = _make_rss_for_items(chunk)
+        _write_rss_tree(tree, part_path)
+
+
 # ========================= 缓存 =========================
 
 def extract_doulist_id(url: str) -> str:
@@ -439,8 +520,6 @@ def crawl_single_doulist(
 
         url = next_url
         page += 1
-
-        _atomic_write(output_file, _write_xml, enable_backup=True, enable_lock=True)
     return all_items
 
 
@@ -494,12 +573,13 @@ def crawl_multiple_doulists(
     print(f"去重后剩余 {len(all_items_dedup)} 条。")
 
     merged_rss_path = os.path.join(output_root, "merged_all_doulists.xml")
-    build_rss(
+    build_rss_segmented(
         all_items_dedup,
         start_url=";".join(urls),
         output_file=merged_rss_path,
         title="多个豆瓣豆列合并（去重后全量）",
-        description="从多个豆列抓取并合并的电影列表，已去重"
+        description="从多个豆列抓取并合并的电影列表，已去重",
+        chunk_size=500
     )
 
     if min_year is not None or max_year is not None:
@@ -514,12 +594,13 @@ def crawl_multiple_doulists(
         desc_text = "，".join(desc_parts) if desc_parts else "无年份过滤"
 
         filtered_path = os.path.join(filtered_root, "merged_filtered.xml")
-        build_rss(
+        build_rss_segmented(
             filtered_items,
             start_url=";".join(urls),
             output_file=filtered_path,
             title="多个豆瓣豆列合并（按年份过滤）",
-            description=f"（{desc_text}）"
+            description=f"（{desc_text}）",
+            chunk_size=500
         )
 
 
